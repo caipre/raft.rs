@@ -1,0 +1,6 @@
+[package]
+name = "raft"
+version = "0.1.0"
+authors = ["Nick Platt <platt.nicholas@gmail.com>"]
+
+[dependencies]
