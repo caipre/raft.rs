@@ -1,0 +1,11 @@
+[package]
+authors = ["Nick Platt <platt.nicholas@gmail.com>"]
+name = "raft"
+version = "0.1.0"
+
+[dependencies]
+byteorder = "0.5.3"
+log = "0.3.6"
+pbuf = "0.3.2"
+protobuf = "1.0.24"
+rand = "0.3.14"

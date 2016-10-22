@@ -1,0 +1,70 @@
+syntax = "proto3";
+package RaftRPC;
+
+enum ExchangeType {
+  APPENDENTRIES = 0;
+  REQUESTVOTE = 1;
+  INSTALLSNAPSHOT = 2;
+}
+
+message Identify {
+  uint64 server_id = 1;
+}
+
+message RPCRequest {
+  ExchangeType type = 1;
+  uint64 server_id = 2;
+  bytes request = 3;
+}
+message RPCReply {
+  ExchangeType type = 1;
+  uint64 server_id = 2;
+  bytes reply = 3;
+}
+
+message LogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  string key = 3;
+  bytes value = 4;
+}
+
+message AppendEntriesRequest {
+  uint64 term = 1; // the leader's term
+  uint64 leaderId = 2; // so follower can redirect clients
+  uint64 prevLogIndex = 3; // index of log entry immediately preceding new ones
+  uint64 prevLogTerm = 4; //term of prevLogIndex entry
+  repeated LogEntry entry = 5; // log entries to store
+  uint64 leaderCommit = 6; // index of highest log entry known to be committed by leader
+}
+
+message AppendEntriesReply {
+  uint64 term = 1; // currentTerm, for leader to update itself
+  bool success = 2; // true if follower contained entry matching prevLogIndex and prevLogTerm.
+}
+
+message RequestVoteRequest {
+  uint64 term = 1;  // candidate's term
+  uint64 candidateId = 2; // candidate requestion vote
+  uint64 lastLogIndex = 3; // index of candidate's last log entry
+  uint64 lastLogTerm = 4; // term of candidate's last log entry
+}
+
+message RequestVoteReply {
+  uint64 term = 1; // currentTerm, for candidate to update itself
+  bool voteGranted = 2; // true means candidate received the vote
+}
+
+message InstallSnapshotRequest{
+  uint64 term = 1; // leader's term
+  uint64 leaderId = 2; // so follower can redirect clients
+  uint64 lastIncludedIndex = 3; // snapshot replaces all entires up through this index
+  uint64 lastIncludedTerm = 4; // term of lastIncludedIndex
+  uint64 offset = 5; // byte offset where chunk is positioned in snapshot file
+  bytes data = 6; // raw bytes of snapshot chunk, starting at offset
+  bool done = 7; // true if this is the last chunk
+}
+
+message InstallSnapshotReply {
+  uint64 term = 1; // currentTerm, for leader to update itself
+}
