@@ -1,3 +1,11 @@
+macro_rules! pass { () => ({}) }
+
+macro_rules! dbg {
+    ($v:path) => ( format!("{:?}", $v) );
+    ($v:ident) => ( format!("{:?}", $v) );
+    ($v:expr) => ( format!("{:?}", $v) );
+}
+
 macro_rules! raftmsg {
     ($id:expr, $msg:ident) => ({
         RaftMsg {
@@ -67,5 +75,9 @@ macro_rules! request_votes {
     })
 }
 
-macro_rules! bindaddr
+macro_rules! bindport
     { ($port:expr) => { format!("127.0.0.1:{}", $port).as_str() } }
+
+macro_rules! localport
+    { ($socket:expr) => { $socket.local_addr.map(|addr| addr.port()).unwrap() } }
+

@@ -35,7 +35,7 @@ impl Timer {
         }
     }
 
-    pub fn take(&mut self) -> Receiver<()> {
+    pub fn take_rx(&mut self) -> Receiver<()> {
         self.rx.take().unwrap()
     }
 
@@ -59,4 +59,3 @@ impl Timer {
         }
     }
 }
-

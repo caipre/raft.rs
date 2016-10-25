@@ -1,8 +1,11 @@
 #![feature(mpsc_select)]
 
 #[macro_use]
-extern crate log;
+extern crate slog;
+extern crate slog_term;
+
 extern crate rand;
+extern crate itertools;
 
 #[macro_use]
 mod macros;
@@ -11,9 +14,11 @@ mod timer;
 
 use std::cmp::{self, Ordering};
 use std::default::Default;
+use std::error::Error;
 use std::fmt;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
+use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::RwLock;
@@ -21,13 +26,32 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
+use itertools::Itertools;
 use rand::Rng;
+use slog::DrainExt;
+use slog::ser;
 
 use timer::Timer;
 
-pub fn start(port: u16, peers: Vec<String>) {
-    let mut server = RaftServer::new();
-    RaftServer::start(&mut server, port, peers);
+pub fn start(id: ServerId, port: u16, peers: Vec<String>) {
+    let term = slog_term::streamer().build();
+    let drain = slog::LevelFilter::new(term, slog::Level::Trace).fuse();
+    let logger = slog::Logger::root(drain, o!());
+
+    let mut server = RaftServer::new(&logger, id, peers);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move|| RaftServer::listen(&logger, port, tx));
+    RaftServer::mainloop(&mut server, rx);
+}
+
+#[derive(Debug)]
+enum Topic {
+    Identity,
+    Election,
+    Peers,
+    Network,
+    RaftMsg,
+    RaftLog,
 }
 
 //// server
@@ -35,20 +59,42 @@ pub fn start(port: u16, peers: Vec<String>) {
 struct RaftServer {
     identity: Identity,
     election: Election,
+    heartbeat: Timer,
     peers: Peers,
     log: RaftLog,
+    logger: slog::Logger,
 }
 
 impl RaftServer {
-    fn new() -> RwLock<RaftServer> {
+    fn new(logger: &slog::Logger, id: ServerId, peers: Vec<String>)
+        -> RwLock<RaftServer> {
+        let logger = logger.new(o!());
+        let cluster_size = peers.len() + 1;
+        info!(logger, "raft server";
+              "id" => id,
+              "cluster size" => cluster_size);
         RwLock::new(
             RaftServer {
-                identity: Identity::new(),
-                election: Election::new(),
-                peers: Peers::new(),
-                log: RaftLog::new(),
+                identity: Identity::new(&logger, id),
+                election: Election::new(&logger, (cluster_size / 2) as u8),
+                heartbeat: Timer::from_millis(1500),
+                peers: Peers::new(&logger, peers),
+                log: RaftLog::new(&logger),
+                logger: logger,
             }
         )
+    }
+
+    fn is_leader(&self) -> bool {
+        self.identity.role == Role::Leader
+    }
+
+    fn is_candidate(&self) -> bool {
+        self.identity.role == Role::Candidate
+    }
+
+    fn is_follower(&self) -> bool {
+        self.identity.role == Role::Follower
     }
 }
 
@@ -59,43 +105,10 @@ struct Identity {
     id: ServerId,
     role: Role,
     leader: Option<ServerId>,
+    logger: slog::Logger,
 }
 
-#[derive(Copy, Clone)]
-#[derive(PartialEq, Eq)]
-struct ServerId(u64);
-
-impl ServerId {
-    fn new() -> ServerId {
-        ServerId(rand::random())
-    }
-}
-
-impl From<u64> for ServerId {
-    fn from(id: u64) -> ServerId {
-        ServerId(id)
-    }
-}
-
-impl FromStr for ServerId {
-    type Err = std::num::ParseIntError;
-    fn from_str(s: &str) -> Result<ServerId, Self::Err> {
-        let id = try!(s.parse());
-        Ok(ServerId(id))
-    }
-}
-
-impl fmt::Debug for ServerId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:x}", (self.0 & 0xffffff))
-    }
-}
-
-impl fmt::Display for ServerId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+type ServerId = usize;
 
 #[derive(Debug)]
 #[derive(Copy, Clone)]
@@ -107,12 +120,37 @@ enum Role {
 }
 
 impl Identity {
-    fn new() -> Identity {
+    fn new(logger: &slog::Logger, id: ServerId) -> Identity {
         Identity {
-            id: ServerId::new(),
+            id: id,
             role: Role::Follower,
             leader: None,
+            //logger: logger.new(o!("topic" => dbg!(Topic::Identity))),
+            logger: logger.new(o!()),
         }
+    }
+
+    fn set_role(&mut self, role: Role) {
+        if self.role != role {
+            info!(self.logger, "change role";
+                  "from" => dbg!(self.role), "to" => dbg!(role));
+            self.role = role;
+        }
+
+        if self.role == Role::Leader {
+            self.set_leader(None);
+        }
+    }
+
+    fn set_leader(&mut self, leader: Option<ServerId>) {
+        if self.leader.is_some() && leader.is_some()
+            && self.leader.unwrap() != leader.unwrap() {
+            info!(self.logger, "change leader";
+                    "from" => self.leader, "to" => leader);
+        } else if leader.is_none() {
+            info!(self.logger, "abandon leader"; "was" => self.leader);
+        }
+        self.leader = leader;
     }
 }
 
@@ -123,21 +161,66 @@ struct Election {
     timer: Timer,
     voted_for: Option<ServerId>,
     votes: u8,
+    votes_required: u8,
+    logger: slog::Logger,
 }
 
 impl Election {
-    fn new() -> Election {
+    fn new(logger: &slog::Logger, votes_required: u8) -> Election {
         let timeout = {
             let mut rng = rand::thread_rng();
-            rng.gen_range(4000, 5000)
+            rng.gen_range(2000, 5000)
         };
+
+        //let logger = logger.new(o!("topic" => dbg!(Topic::Election)));
+        let logger = logger.new(o!());
+
+        info!(logger, "election timeout {}ms", timeout);
 
         Election {
             term: 0,
             timer: Timer::from_millis(timeout),
             voted_for: None,
             votes: 0,
+            votes_required: votes_required,
+            logger: logger,
         }
+    }
+
+    fn set_term(&mut self, term: usize) {
+        info!(self.logger, "change term";
+            "from" => self.term, "to" => term);
+        self.term = term;
+    }
+
+    fn vote_for(&mut self, id: ServerId) {
+        info!(self.logger, "vote for {}", id);
+        self.voted_for = Some(id);
+    }
+
+    fn start_election(&mut self, id: ServerId) {
+        warn!(self.logger, "start an election"; "term" => self.term);
+        self.term += 1;
+        self.votes = 1;
+        self.voted_for = Some(id);
+        self.timer.reset();
+    }
+
+    fn add_vote(&mut self) {
+        self.votes += 1;
+        info!(self.logger, "receive yes vote"; "votes" => self.votes);
+    }
+
+    fn majority(&self) -> bool {
+        let majority = self.votes > self.votes_required;
+        if majority {
+            info!(self.logger, "election success");
+        }
+        majority
+    }
+
+    fn fail(&self) {
+        warn!(self.logger, "election failure"; "votes" => self.votes);
     }
 }
 
@@ -145,11 +228,12 @@ impl Election {
 
 struct Peers {
     peers: Vec<Peer>,
-    socket: Option<UdpSocket>,
+    logger: slog::Logger,
 }
 
 struct Peer {
-    id: Option<ServerId>,
+    id: ServerId,
+    socket: UdpSocket,
     addr: SocketAddr,
     positions: Option<Positions>,
     sent: Option<Positions>,
@@ -160,53 +244,91 @@ struct Positions {
     mindex: usize,
 }
 
+#[derive(Debug)]
+enum To {
+    AllPeers,
+    PeerId(ServerId),
+}
+
 impl Peers {
-    fn new() -> Peers {
+    fn new(logger: &slog::Logger, argpeers: Vec<String>) -> Peers {
+        //let logger = logger.new(o!("topic" => dbg!(Topic::Peers)));
+        let logger = logger.new(o!());
+
+        let mut peers = vec![];
+        for peer in argpeers {
+            let mut pieces = peer.splitn(2, ":");
+            debug!(logger, "peer: {:?}",
+                   pieces.clone().collect::<Vec<_>>());
+
+            let id =
+                pieces.next()
+                    .map(|id| ServerId::from_str(id).ok())
+                    .expect("unable to parse peer id")
+                    .unwrap();
+
+            let addr =
+                pieces.next()
+                    .map(|addr| SocketAddr::from_str(addr).ok())
+                    .expect("unable to parse peer addr")
+                    .unwrap();
+
+            peers.push(Peer::new(id, addr));
+        }
+
         Peers {
-            peers: vec![],
-            socket: None,
+            peers: peers,
+            logger: logger,
         }
     }
 
-    fn set_peer_id(&mut self, id: ServerId, addr: SocketAddr) {
-        if let Some(ref mut peer) = self.peers.iter_mut().find(|peer| peer.addr == addr) {
-            peer.id = Some(id);
+    fn send_msg(&self, msg: RaftMsg, to: To) {
+        debug!(self.logger, "send message";
+              "xtype" => dbg!(msg.xtype),
+              "xpart" => dbg!(msg.xpart),
+              "to" => dbg!(to));
+
+        let buf = msg.to_string();
+        let sendmsg = |peer: &Peer| {
+            peer.socket.send_to(buf.as_bytes(), peer.addr);
+        };
+
+        match to {
+            To::AllPeers => {
+                self.peers.iter()
+                    .foreach(sendmsg);
+            },
+
+            To::PeerId(id) => {
+                self.peers.iter()
+                    .find(|peer| peer.id == id)
+                    .and_then(|peer| Some(sendmsg(peer)));
+            },
         }
-        // else {
-        //     self.0.push(Peer {
-        //         id: Some(id),
-        //         addr: addr,
-        //         positions: None,
-        //         sent: None,
-        //     });
-        // }
     }
 }
 
 impl Peer {
-    fn new(addr: &str) -> Peer {
+    fn new(id: ServerId, addr: SocketAddr) -> Peer {
+        let socket = {
+            let mut rng = rand::thread_rng();
+            rng.gen_iter::<u16>()
+                .filter(|n| n > &1000u16).take(5)
+                .map(|port| UdpSocket::bind(bindport!(port)))
+                .find(|socket| socket.is_ok())
+                .expect("unable to find port to bind to")
+                .unwrap()
+        };
+
         Peer {
-            id: None,
-            addr: SocketAddr::from_str(addr).unwrap(),
+            id: id,
+            addr: addr,
+            socket: socket,
             positions: None,
             sent: None,
         }
     }
 }
-
-impl Deref for Peers {
-    type Target = Vec<Peer>;
-    fn deref(&self) -> &Vec<Peer> {
-        &self.peers
-    }
-}
-
-impl DerefMut for Peers {
-    fn deref_mut(&mut self) -> &mut Vec<Peer> {
-        &mut self.peers
-    }
-}
-
 
 //// raftlog
 
@@ -214,6 +336,7 @@ struct RaftLog {
     cindex: usize,
     aindex: usize,
     entries: Vec<LogEntry>,
+    logger: slog::Logger,
 }
 
 #[derive(Debug)]
@@ -226,21 +349,14 @@ struct LogEntry {
     // val: String,
 }
 
-impl Default for LogEntry {
-    fn default() -> LogEntry {
-        LogEntry {
-            index: 0,
-            term: 0,
-        }
-    }
-}
-
 impl RaftLog {
-    fn new() -> RaftLog {
+    fn new(logger: &slog::Logger) -> RaftLog {
         RaftLog {
             cindex: 0,
             aindex: 0,
             entries: vec![],
+            //logger: logger.new(o!("topic" => dbg!(Topic::RaftLog))),
+            logger: logger.new(o!()),
         }
     }
 
@@ -252,6 +368,7 @@ impl RaftLog {
     }
 
     fn check_conflict(&mut self, entries: &Vec<LogEntry>) {
+        trace!(self.logger, "check_conflict");
         // 3. If an existing entry conflicts with a new one (same index
         //    but different terms), delete the existing entry and all that
         //    follow it.
@@ -261,7 +378,8 @@ impl RaftLog {
                 None => break,
                 Some(&ref e @ LogEntry { .. }) => {
                     if e.term != entry.term {
-                        info!("conflicting entries: {:?} != {:?}", e, entry);
+                        info!(self.logger, "log entry conflict";
+                              "ours" => dbg!(e), "theirs" => dbg!(entry));
                         conflict = Some(entry.index);
                         break;
                     }
@@ -269,38 +387,57 @@ impl RaftLog {
             }
         }
         if let Some(idx) = conflict {
+            info!(self.logger, "truncate"; "index" => idx);
             self.entries.truncate(idx); // XXX: off by 1?
+        } else {
+            // was none
         }
     }
 
     fn append_new(&mut self, entries: Vec<LogEntry>) {
+        trace!(self.logger, "append_new");
         // 4. Append any new entries not already in the log.
         let idx = entries.last().map_or(0, |e| e.index);
         let mut news = entries.into_iter().skip_while(|e| e.index < idx).collect::<Vec<LogEntry>>();
-        info!("append {} new entries to log", news.len());
+        info!(self.logger, "append new entries"; "count" =>  news.len());
         self.entries.append(&mut news);
     }
 
     fn commit_to(&mut self, cindex: usize) {
+        trace!(self.logger, "commit_to");
         // 5. If leaderCommit > commitIndex, set commitIndex =
         //    min(leaderCommit, index of last new entry)
         if self.cindex < cindex {
             let idx = self.entries.last().map_or(cindex, |e| e.index);
-            self.cindex = cmp::min(cindex, idx);
-            info!("advance commit index to {}", self.cindex);
+            let new = cmp::min(cindex, idx);
+            info!(self.logger, "advance commit index";
+                  "from" => self.cindex, "to" => new);
+            self.cindex = new;
         }
     }
 
     fn apply(&mut self) {
+        trace!(self.logger, "apply");
         // Rules for All Servers:
         // If commitIndex > lastApplied: increment lastApplied, apply
         // log[lastApplied] to state machine.
-        while self.aindex < self.cindex {
+        if self.aindex < self.cindex {
+            info!(self.logger, "advance apply index";
+                  "from" => self.aindex, "to" => self.cindex);
             self.aindex = self.cindex;
-            info!("advance apply index to {}", self.aindex);
         }
     }
 }
+
+impl Default for LogEntry {
+    fn default() -> LogEntry {
+        LogEntry {
+            index: 0,
+            term: 0,
+        }
+    }
+}
+
 
 impl PartialEq for LogEntry {
     fn eq(&self, other: &LogEntry) -> bool {
@@ -352,6 +489,7 @@ type RpcResult = Result<(), RpcError>;
 
 impl RequestHandler<AppendEntriesRequest, AppendEntriesReply> for RaftServer {
     fn inspect_request(&self, request: &AppendEntriesRequest) -> RpcResult {
+        trace!(self.logger, "inspect_request");
         // 1. Reply false if term < currentTerm.
         if request.term < self.election.term {
             return Err(RpcError::StaleTerm);
@@ -360,7 +498,8 @@ impl RequestHandler<AppendEntriesRequest, AppendEntriesReply> for RaftServer {
         // 2. Reply false if log doesn’t contain an entry at prevLogIndex
         //    whose term matches prevLogTerm.
         match self.log.entries.get(request.prevLogIndex) {
-            None => return Err(RpcError::LogEntryMissing),
+            // None => return Err(RpcError::LogEntryMissing),
+            None => return Ok(()),
             Some(&LogEntry { ref term, .. }) => {
                 if *term != request.prevLogTerm {
                     return Err(RpcError::TermMismatch);
@@ -373,13 +512,13 @@ impl RequestHandler<AppendEntriesRequest, AppendEntriesReply> for RaftServer {
 
     fn handle_request(&mut self, request: AppendEntriesRequest) -> AppendEntriesReply {
         if let Err(err) = self.inspect_request(&request) {
-            info!(":: deny request ({:?})", err);
+            info!(self.logger, "reject request"; "reason" => dbg!(err));
             return reply!(self, false)
         }
 
         self.election.timer.reset();
-        self.maybe_change_role(request.term);
-        self.set_leader(request.leaderId);
+        self.check_term(request.term);
+        self.identity.set_leader(Some(request.leaderId));
         self.log.append(request.entries, request.leaderCommit);
         return reply!(self, true);
     }
@@ -387,6 +526,7 @@ impl RequestHandler<AppendEntriesRequest, AppendEntriesReply> for RaftServer {
 
 impl RequestHandler<RequestVotesRequest, RequestVotesReply> for RaftServer {
     fn inspect_request(&self, request: &RequestVotesRequest) -> RpcResult {
+        trace!(self.logger, "inspect_request");
         // 1. Reply false if term < currentTerm.
         if request.term < self.election.term {
             return Err(RpcError::StaleTerm);
@@ -409,35 +549,37 @@ impl RequestHandler<RequestVotesRequest, RequestVotesReply> for RaftServer {
 
     fn handle_request(&mut self, request: RequestVotesRequest) -> RequestVotesReply {
         if let Err(err) = self.inspect_request(&request) {
-            info!(":: deny request ({:?})", err);
+            info!(self.logger, "reject request"; "reason" => dbg!(err));
             return reply!(self, false)
         }
 
         self.election.timer.reset();
-        self.maybe_change_role(request.term);
-        self.election.voted_for = Some(request.candidateId);
+        self.check_term(request.term);
+        self.election.vote_for(request.candidateId);
         return reply!(self, true);
     }
 }
 
 impl ReplyHandler<AppendEntriesReply> for RaftServer {
     fn handle_reply_from(&mut self, from: ServerId, reply: AppendEntriesReply) {
-        self.maybe_change_role(reply.term);
-        if self.identity.role != Role::Leader {
+        self.check_term(reply.term);
+        if !self.is_leader() {
+            info!(self.logger, "ignore message");
             return;
         }
 
-        let ref mut _peer =
-            self.peers.iter_mut()
-                .find(|peer| peer.id.unwrap() == from)
-                .unwrap();
+        // let ref mut _peer =
+        //     self.peers.iter_mut()
+        //         .find(|peer| peer.id.unwrap() == from)
+        //         .unwrap();
 
         if reply.success {
-            warn!("unimplemented");
+            info!(self.logger, "update peer positions");
             // (*peer).positions.unwrap().nindex = peer.sent.unwrap().nindex;
             // (*peer).positions.unwrap().mindex = peer.sent.unwrap().mindex;
         } else {
-            warn!("unimplemented");
+            info!(self.logger, "retry append entries";
+                  "new nindex" => -1);
             // TODO: send append_entries again for reply.serverId
             // (*peer).positions.unwrap().nindex -= 1;
         }
@@ -446,21 +588,20 @@ impl ReplyHandler<AppendEntriesReply> for RaftServer {
 
 impl ReplyHandler<RequestVotesReply> for RaftServer {
     fn handle_reply_from(&mut self, from: ServerId, reply: RequestVotesReply) {
-        self.maybe_change_role(reply.term);
-        if self.identity.role != Role::Candidate {
-            info!("not a candidate, ignore vote");
+        self.check_term(reply.term);
+        if !self.is_candidate() {
+            info!(self.logger, "ignore message");
             return;
         }
 
         if reply.voteGranted {
-            self.election.votes += 1;
-            info!("yes vote from {} (count: {})", from, self.election.votes);
-            if self.election.votes as usize > (self.peers.len() / 2) {
-                info!("seen majority");
+            self.election.add_vote();
+
+            if self.election.majority() {
                 self.change_to(Role::Leader);
             }
         } else {
-            warn!("saw vote rejection")
+            warn!(self.logger, "saw vote rejection")
         }
     }
 }
@@ -468,164 +609,120 @@ impl ReplyHandler<RequestVotesReply> for RaftServer {
 //// server behavior
 
 impl RaftServer {
-    fn change_to(&mut self, role: Role) {
-        info!("role: {:?} -> {:?}", self.identity.role, role);
-        self.identity.role = role;
-        match role {
-            Role::Leader => {
-                self.identity.leader = None;
-                self.send_msg(heartbeat!(self), To::AllPeers);
-            },
-
-            Role::Candidate => {
-                self.start_new_election();
-            },
-
-            Role::Follower => {},
-        }
-    }
-
-    fn maybe_change_role(&mut self, term: usize) {
+    fn check_term(&mut self, term: usize) {
+        trace!(self.logger, "check_term");
         if self.election.term < term {
-            info!("term: {} -> {}", self.election.term, term);
-            self.election.term = term;
+            self.election.set_term(term);
             self.change_to(Role::Follower);
         }
     }
 
-    fn set_leader(&mut self, leader: ServerId) {
-        assert_eq!(self.identity.role, Role::Follower);
-        info!("leader: {} -> {}", self.identity.leader.unwrap(), leader);
-        self.identity.leader = Some(leader);
+    fn change_to(&mut self, role: Role) {
+        self.identity.set_role(role);
+        match role {
+            Role::Leader =>
+                self.peers.send_msg(heartbeat!(self), To::AllPeers),
+
+            Role::Candidate =>
+                self.campaign(),
+
+            Role::Follower =>
+                pass!(),
+        }
     }
 
-    fn start_new_election(&mut self) {
-        assert_eq!(self.identity.role, Role::Candidate);
-        info!("starting election (term {})", self.election.term);
-        self.election.term += 1;
-        self.election.votes = 1;
-        self.election.voted_for = Some(self.identity.id);
-        self.election.timer.reset();
-        self.send_msg(request_votes!(self), To::AllPeers);
+    fn campaign(&mut self) {
+        assert!(self.is_candidate());
+        self.identity.set_leader(None);
+        self.election.start_election(self.identity.id);
+        self.peers.send_msg(request_votes!(self), To::AllPeers);
     }
 }
 
 //// server functionality
 
 impl RaftServer {
-    fn listen(socket: UdpSocket, tx: Sender<(SocketAddr, RaftMsg)>) {
+    fn listen(logger: &slog::Logger, port: u16, tx: Sender<RaftMsg>) {
+        let socket = UdpSocket::bind(bindport!(port)).unwrap();
+        //let logger = logger.new(o!("topic" => dbg!(Topic::Network)));
+        let logger = logger.new(o!());
+        info!(logger, "listening"; "port" => port);
         loop {
             let mut buf = [0; 1500]; // mtu
             let (amt, src) = socket.recv_from(&mut buf).unwrap();
-            let msg = RaftMsg::from_str(String::from_utf8(buf[..amt].to_vec()).unwrap().as_str()).unwrap();
-            info!("recv_msg {:?} {:?} from {}", msg.xtype, msg.xpart, msg.sender);
-            tx.send((src, msg)).unwrap();
+            debug!(logger, "message received";
+                   "raw contents" => String::from_utf8_lossy(&buf[..amt]).into_owned());
+            if let Ok(msgstr) = String::from_utf8(buf[..amt].to_vec()) {
+                match RaftMsg::from_str(msgstr.as_str()) {
+                    Ok(raftmsg) => {
+                            info!(logger, "message received";
+                                "xtype" => dbg!(raftmsg.xtype),
+                                "xpart" => dbg!(raftmsg.xpart),
+                                "from" => raftmsg.sender);
+                            tx.send(raftmsg).unwrap();
+                        },
+
+                    Err(RaftParseError(err)) => {
+                        warn!(logger, "message invalid"; "reason" => err);
+                    },
+                }
+            }
          }
     }
 
-    fn start(server: &mut RwLock<RaftServer>, port: u16, argpeers: Vec<String>) -> ! {
-        {
-            let server = server.read().unwrap();
-            info!("server id {:?} :: recv port {} :: election timeout {}ms",
-                  server.identity.id, port, server.election.timer.timeout);
-        }
+    fn mainloop(server: &mut RwLock<RaftServer>, message: Receiver<RaftMsg>) -> ! {
+        let election = { server.write().unwrap().election.timer.take_rx() };
+        let heartbeat = { server.write().unwrap().heartbeat.take_rx() };
 
-        let election = { server.write().unwrap().election.timer.take() };
-
-        let mut timer = Timer::from_millis(1500);
-        let heartbeat = timer.take();
-
-        let (tx, cluster) = mpsc::channel();
-        let socket = UdpSocket::bind(bindaddr!(port)).unwrap();
-        {
-            let socket = socket.try_clone().unwrap();
-            thread::spawn(move|| RaftServer::listen(socket, tx));
-        }
-
-        {
-            let ref mut peers = server.write().unwrap().peers;
-            peers.socket = Some(socket);
-            for addr in argpeers {
-                info!("add peer addr {}", addr);
-                peers.push(Peer::new(addr.as_str()));
-            }
-        }
-
-        // mainloop
         loop {
             select! {
                 _tick = election.recv() => {
                     let mut server = server.get_mut().unwrap();
-                    if server.identity.role == Role::Candidate {
-                        info!("election failed (votes {})", server.election.votes);
+                    if server.is_candidate() {
+                        server.election.fail();
                     }
-                    info!("───────────────────── election timeout ─────────────────────");
-                    server.change_to(Role::Candidate);
+                    if !server.is_leader() {
+                        server.change_to(Role::Candidate);
+                    }
                 },
 
                 _tick = heartbeat.recv() => {
                     let server = server.read().unwrap();
-                    if server.identity.role == Role::Leader {
-                        info!("send heartbeats");
-                        server.send_msg(heartbeat!(server), To::AllPeers);
+                    if server.is_leader() {
+                        server.peers.send_msg(heartbeat!(server), To::AllPeers);
                     }
                 },
 
-                pair = cluster.recv() => {
-                    let (src, msg) = pair.unwrap();
+                msg = message.recv() => {
+                    let msg = msg.unwrap();
                     let mut server = server.get_mut().unwrap();
-                    server.peers.set_peer_id(msg.sender, src);
+                    info!(server.identity.logger, "identity";
+                          "role" => dbg!(server.identity.role),
+                          "leader" => server.identity.leader);
                     match msg.data {
-                        MsgData::AppendEntriesRequest(request) => {
-                            let reply = server.handle_request(request);
-                            server.send_msg(raftmsg!(server.identity.id, reply), To::PeerAddr(src));
+                        MsgData::AppendEntriesRequest(data) => {
+                            let reply = server.handle_request(data);
+                            server.peers.send_msg(
+                                raftmsg!(server.identity.id, reply),
+                                To::PeerId(msg.sender));
                         },
 
-                        MsgData::RequestVotesRequest(request) => {
-                            let reply = server.handle_request(request);
-                            server.send_msg(raftmsg!(server.identity.id, reply), To::PeerAddr(src));
+                        MsgData::RequestVotesRequest(data) => {
+                            let reply = server.handle_request(data);
+                            server.peers.send_msg(
+                                raftmsg!(server.identity.id, reply),
+                                To::PeerId(msg.sender));
                         },
 
-                        MsgData::AppendEntriesReply(reply) => {
-                            server.handle_reply_from(msg.sender, reply);
+                        MsgData::AppendEntriesReply(data) => {
+                            server.handle_reply_from(msg.sender, data);
                         },
 
-                        MsgData::RequestVotesReply(reply) => {
-                            server.handle_reply_from(msg.sender, reply);
+                        MsgData::RequestVotesReply(data) => {
+                            server.handle_reply_from(msg.sender, data);
                         },
                     }
                 }
-            }
-        }
-    }
-}
-
-//// server communication
-
-enum To {
-    AllPeers,
-    PeerId(ServerId),
-    PeerAddr(SocketAddr),
-}
-
-impl RaftServer {
-    fn send_msg(&self, msg: RaftMsg, to: To) {
-        let buf = msg.to_string();
-        match to {
-            To::AllPeers => {
-                for peer in self.peers.iter() {
-                    info!("send_msg {:?} {:?} to {}", msg.xtype, msg.xpart, peer.addr);
-                    self.peers.socket.as_ref().unwrap().send_to(buf.as_bytes(), peer.addr);
-                }
-            },
-
-            To::PeerAddr(addr) => {
-                info!("send_msg {:?} {:?} to {}", msg.xtype, msg.xpart, addr);
-                self.peers.socket.as_ref().unwrap().send_to(buf.as_bytes(), addr);
-            },
-
-            To::PeerId(_) => {
-                unimplemented!();
             }
         }
     }
@@ -698,11 +795,24 @@ impl ToString for RaftMsg {
     }
 }
 
-struct RaftParseError;
+#[derive(Debug)]
+struct RaftParseError(String);
 
-impl fmt::Debug for RaftParseError {
+impl Error for RaftParseError {
+    fn description(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for RaftParseError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        "unable to parse".fmt(f)
+        self.0.as_str().fmt(f)
+    }
+}
+
+impl From<ParseIntError> for RaftParseError {
+    fn from(err: ParseIntError) -> RaftParseError {
+        RaftParseError(err.description().to_string())
     }
 }
 
@@ -712,9 +822,8 @@ impl FromStr for RaftMsg {
         macro_rules! parse { ($iter:ident) => { $iter.next().unwrap().parse().unwrap() } }
 
         let mut iter = s.split(":");
-        debug!("{:?}", iter.clone().collect::<Vec<_>>());
 
-        let sender = iter.next().unwrap().parse::<ServerId>().unwrap();
+        let sender = try!(iter.next().unwrap().parse::<ServerId>());
         let xtype = iter.next().unwrap().parse::<ExchangeType>().unwrap();
         let xpart = iter.next().unwrap().parse::<ExchangePart>().unwrap();
 
@@ -782,7 +891,7 @@ impl FromStr for ExchangeType {
         match s {
             "AppendEntries" => Ok(ExchangeType::AppendEntries),
             "RequestVotes" => Ok(ExchangeType::RequestVotes),
-            _ => Err(RaftParseError),
+            _ => Err(RaftParseError(String::from("unknown exchange type"))),
         }
     }
 }
@@ -793,7 +902,7 @@ impl FromStr for ExchangePart {
         match s {
             "Request" => Ok(ExchangePart::Request),
             "Reply" => Ok(ExchangePart::Reply),
-            _ => Err(RaftParseError),
+            _ => Err(RaftParseError(String::from("unknown exchange part"))),
         }
     }
 }
