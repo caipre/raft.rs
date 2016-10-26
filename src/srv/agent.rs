@@ -36,10 +36,10 @@ impl Agent {
         Agent(peer)
     }
 
-    fn recv(prx: Receiver<ExchangeType>, mtx: Sender<RaftMessage>) {
+    fn recv(prx: Receiver<ExchangeType>, mtx: Sender<(Agent, RaftMessage)>) {
         loop {
             match prx.recv() {
-                Ok(proto) => mtx.send(proto.into()),
+                Ok(proto) => mtx.send((&self, proto.into())),
                 Err(RecvError) => panic!("sender disconnected"),
             }
         }
