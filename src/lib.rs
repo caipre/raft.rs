@@ -143,12 +143,25 @@ impl Identity {
     }
 
     fn set_leader(&mut self, leader: Option<ServerId>) {
-        if self.leader.is_some() && leader.is_some()
-            && self.leader.unwrap() != leader.unwrap() {
-            info!(self.logger, "change leader";
-                    "from" => self.leader, "to" => leader);
-        } else if leader.is_none() {
-            info!(self.logger, "abandon leader"; "was" => self.leader);
+        match (self.leader, leader) {
+            (Some(ref cur), Some(new)) if *cur != new => {
+                info!(self.logger, "change leader";
+                        "from" => self.leader, "to" => leader);
+            },
+
+            (Some(_), Some(_)) => pass!(),
+
+            (Some(_), None) => {
+                warn!(self.logger, "abandon leader"; "was" => self.leader);
+            },
+
+            (None, Some(_)) => {
+                info!(self.logger, "follow leader"; "now" => self.leader);
+            },
+
+            (None, None) => {
+                crit!(self.logger, "without leader");
+            },
         }
         self.leader = leader;
     }
